@@ -76,7 +76,8 @@ class Subject(object):
             # we using full text search which could give ambigous results
             # so we must filter out irrelevant results
             if item.subject == self.subject:
-                relevant_series.append(item)
+                if item.is_relevant_to_search():
+                    relevant_series.append(item)
         self._relevant_series = sorted(relevant_series, key=lambda k: k.version)
         rfcs = sorted((s for s in relevant_series if RFC_TAG in s.tags), key=lambda k: k.version)
         non_rfcs = sorted((s for s in relevant_series if RFC_TAG not in s.tags), key=lambda k: k.version)

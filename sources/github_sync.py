@@ -593,10 +593,13 @@ class GithubSync(object):
         for subject_name in self.prs:
             pr = self.prs[subject_name]
             if subject_name not in subject_names and self._is_relevant_pr(pr):
-                branch_name = self.prs[subject_name].head.ref
-                series_id = branch_name.split("/")[1].split(HEAD_BASE_SEPARATOR)[0]
+                branch_name_pr = self.prs[subject_name].head.ref
+                series_id = branch_name_pr.split("/")[1].split(HEAD_BASE_SEPARATOR)[0]
                 series = self.pw.get_series_by_id(series_id)
                 subject = self.pw.get_subject_by_series(series)
+                if subject_name != subject.subject:
+                    self.logger.error(f"Renaming PR {pr.number} from {subject_name} to {subject.subject} according to {subject.latest_series.id}")
+                    pr.edit(title=subject.subject)
                 branch_name = f"{subject.branch}{HEAD_BASE_SEPARATOR}{self.master}"
                 self.checkout_and_patch(branch_name, subject.latest_series)
         self.expire_branches()
