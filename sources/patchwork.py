@@ -51,6 +51,8 @@ class Subject(object):
 
     @property
     def branch(self):
+        if len(self.relevant_series) == 0:
+            return None
         return f"series/{self.relevant_series[0].id}"
 
     def __getattr__(self, fn):
@@ -58,14 +60,16 @@ class Subject(object):
 
     @property
     def latest_series(self):
+        if len(self.relevant_series) == 0:
+            return None
         return self.relevant_series[-1]
 
     @property
     def relevant_series(self):
         """
-            cache and return sorted list of relevant series
-            where first element is first known version of same subject
-            and last is the most recent
+        cache and return sorted list of relevant series
+        where first element is first known version of same subject
+        and last is the most recent
         """
         if self._relevant_series:
             return self._relevant_series
@@ -79,8 +83,13 @@ class Subject(object):
                 if item.is_relevant_to_search():
                     relevant_series.append(item)
         self._relevant_series = sorted(relevant_series, key=lambda k: k.version)
-        rfcs = sorted((s for s in relevant_series if RFC_TAG in s.tags), key=lambda k: k.version)
-        non_rfcs = sorted((s for s in relevant_series if RFC_TAG not in s.tags), key=lambda k: k.version)
+        rfcs = sorted(
+            (s for s in relevant_series if RFC_TAG in s.tags), key=lambda k: k.version
+        )
+        non_rfcs = sorted(
+            (s for s in relevant_series if RFC_TAG not in s.tags),
+            key=lambda k: k.version,
+        )
         self._relevant_series = rfcs + non_rfcs
         return self._relevant_series
 
@@ -104,8 +113,8 @@ class Series(object):
     def diffs(self):
         # fetching patches
         """
-            Returns patches preserving original order
-            for the most recent relevant series
+        Returns patches preserving original order
+        for the most recent relevant series
         """
         if self._diffs:
             return self._diffs
@@ -117,8 +126,8 @@ class Series(object):
 
     def _closed(self):
         """
-            Series considered closed if at least one patch in this series
-            is in irrelevant states
+        Series considered closed if at least one patch in this series
+        is in irrelevant states
         """
         for diff in self.diffs:
             if diff["state"] in IRRELEVANT_STATES:
@@ -144,8 +153,8 @@ class Series(object):
     @property
     def tags(self):
         """
-           Tags fetched from series name, diffs and cover letter
-           for most relevant series
+        Tags fetched from series name, diffs and cover letter
+        for most relevant series
         """
         if self._tags:
             return self._tags
@@ -225,7 +234,6 @@ class Series(object):
             elif diff[key] != value:
                 return False
         return True
-
 
     def is_relevant_to_search(self):
         for pattern in self.pw_client.pw_search_patterns:

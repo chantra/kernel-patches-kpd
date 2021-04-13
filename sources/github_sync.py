@@ -170,7 +170,7 @@ class GithubSync(object):
 
     def fetch_master(self):
         """
-            Fetch master only once
+        Fetch master only once
         """
         self.local_repo = self.fetch_repo(self.repodir, self.repo_url, self.master)
         self.ci_local_repo = self.fetch_repo(
@@ -190,7 +190,7 @@ class GithubSync(object):
 
     def _create_dummy_commit(self, branch_name):
         """
-            Reset branch, create dummy commit
+        Reset branch, create dummy commit
         """
         self._reset_repo(self.local_repo, f"{self.source_remote}/{self.source_master}")
         if branch_name in self.local_repo.branches:
@@ -225,11 +225,11 @@ class GithubSync(object):
 
     def _guess_pr(self, series, branch=None):
         """
-            Series could change name
-            first series in a subject could be changed as well
-            so we want to
-            - try to guess based on name first
-            - try to guess based on first series
+        Series could change name
+        first series in a subject could be changed as well
+        so we want to
+        - try to guess based on name first
+        - try to guess based on first series
         """
         title = f"{series.subject}"
         subject = None
@@ -270,7 +270,7 @@ class GithubSync(object):
         flag=False,
     ):
         """
-            Appends comment to a PR.
+        Appends comment to a PR.
         """
         title = f"{series.subject}"
         pr_tags = copy.copy(series.visible_tags)
@@ -323,7 +323,7 @@ class GithubSync(object):
                 try:
                     pr.create_issue_comment(message)
                 except GithubException as e:
-                    emsg = e._GithubException__data['message']
+                    emsg = e._GithubException__data["message"]
                     if emsg in KNOWN_OK_COMMENT_EXCEPTIONS:
                         self.logger.error(f"BUG: {emsg}")
                     else:
@@ -416,7 +416,10 @@ class GithubSync(object):
             # we have branch, but we don't have a PR, which mean we must try to
             # re-open PR first, before doing force-push
             pr = self._comment_series_pr(
-                series, message=comment, branch_name=branch_name, can_create=True,
+                series,
+                message=comment,
+                branch_name=branch_name,
+                can_create=True,
             )
             self.local_repo.git.push("-f", "origin", branch_name)
             return pr
@@ -430,7 +433,10 @@ class GithubSync(object):
             # which most likely mean we need to create new branch and thus PR
             self.local_repo.git.push("-f", "origin", branch_name)
             return self._comment_series_pr(
-                series, message=comment, branch_name=branch_name, can_create=True,
+                series,
+                message=comment,
+                branch_name=branch_name,
+                can_create=True,
             )
         else:
             # no code changes, just update tags
@@ -438,10 +444,10 @@ class GithubSync(object):
 
     def checkout_and_patch(self, branch_name, series_to_apply):
         """
-            Patch in place and push.
-            Returns true if whole series applied.
-            Return False if at least one patch in series failed.
-            If at least one patch in series failed nothing gets pushed.
+        Patch in place and push.
+        Returns true if whole series applied.
+        Return False if at least one patch in series failed.
+        If at least one patch in series failed nothing gets pushed.
         """
         self.stat_update("all_known_subjects")
         if self._pr_closed(branch_name, series_to_apply):
@@ -485,11 +491,11 @@ class GithubSync(object):
 
     def _is_relevant_pr(self, pr):
         """
-            PR is relevant if it
-            - coming from user
-            - to same user
-            - to branch {master}
-            - is open
+        PR is relevant if it
+        - coming from user
+        - to same user
+        - to branch {master}
+        - is open
         """
         src_user = pr.head.user.login
         src_branch = pr.head.ref
@@ -556,12 +562,12 @@ class GithubSync(object):
 
     def sync_branches(self):
         """
-            One subject = one branch
-            creates branches when necessary
-            apply patches where it's necessary
-            delete branches where it's necessary
-            version of series applies in the same branch
-            as separate commit
+        One subject = one branch
+        creates branches when necessary
+        apply patches where it's necessary
+        delete branches where it's necessary
+        version of series applies in the same branch
+        as separate commit
         """
 
         # sync mirror and fetch current states of PRs
@@ -598,10 +604,17 @@ class GithubSync(object):
                 series = self.pw.get_series_by_id(series_id)
                 subject = self.pw.get_subject_by_series(series)
                 if subject_name != subject.subject:
-                    self.logger.error(f"Renaming PR {pr.number} from {subject_name} to {subject.subject} according to {subject.latest_series.id}")
+                    self.logger.error(
+                        f"Renaming PR {pr.number} from {subject_name} to {subject.subject} according to {subject.latest_series.id}"
+                    )
                     pr.edit(title=subject.subject)
                 branch_name = f"{subject.branch}{HEAD_BASE_SEPARATOR}{self.master}"
-                self.checkout_and_patch(branch_name, subject.latest_series)
+                if not branch_name:
+                    branch_name = branch_name_pr
+                latest_series = subject.latest_series
+                if not latest_series:
+                    latest_series = series
+                self.checkout_and_patch(branch_name, latest_series)
         self.expire_branches()
         patches_done = time.time()
         self.stat_update("full_cycle_duration", patches_done - sync_start)
