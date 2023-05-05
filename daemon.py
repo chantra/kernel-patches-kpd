@@ -19,7 +19,7 @@ from opentelemetry.sdk.metrics.export import (
 )
 from opentelemetry.sdk.resources import Resource
 
-from .github_sync import GithubSync  # @manual
+from sources.github_sync import GithubSync  # @manual
 
 logger: logging.Logger = logging.getLogger(__name__)
 
