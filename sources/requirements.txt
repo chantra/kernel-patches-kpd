@@ -4,3 +4,6 @@ PyGithub
 tzlocal
 requests
 gitpython
+cachetools
+opentelemetry-api
+opentelemetry-sdk

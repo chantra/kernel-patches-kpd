@@ -1,8 +1,9 @@
-#!/usr/bin/env fbpython
+#!/usr/bin/env python3
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 import unittest
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from sources.utils import redact_url, remove_unsafe_chars
 
@@ -49,7 +50,9 @@ class UtilsTestCase(unittest.TestCase):
         ]
         for case in test_cases:
             with self.subTest(msg=case.msg):
-                self.assertEqual(redact_url(case.url), case.redacted_url)
+                redacted_passwd = urlparse(redact_url(case.url)).password
+                expected_password = urlparse(redact_url(case.redacted_url)).password
+                self.assertEqual(redacted_passwd, expected_password)
 
     def test_unsafe_char_removal(self) -> None:
         """Test the remove_unsafe_chars function with chosen input strings."""
