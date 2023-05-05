@@ -1,452 +1,510 @@
 #!/usr/bin/env python3
-import json
-import requests
-import datetime as DT
-import re
-import logging
-import datetime
-import time
-import dateutil.parser as dp
-import pytz
-import functools
-import tempfile
 
-from tzlocal import get_localzone
+import copy
+import datetime
+import json
+import logging
+import re
+import tempfile
+from typing import Any, AnyStr, Callable, Dict, IO, List, Optional, Sequence, Set
+from urllib.parse import urljoin
+
+import dateutil.parser as dateparser
+import requests
+from cachetools import cached, TTLCache
+from opentelemetry import metrics
+from pyre_extensions import none_throws
+from requests.adapters import HTTPAdapter
+
+from .stats import Stats  # @manual:=stats
 
 # when we want to push this patch through CI
-RELEVANT_STATES = {
+RELEVANT_STATES: Dict[str, int] = {
     "new": 1,
+    "under-review": 2,
     "rfc": 5,
     "changes-requested": 7,
+    "queued": 13,
+    "needs_ack": 15,
 }
-RFC_TAG = "RFC"
-RELEVANT_STATE_IDS = [RELEVANT_STATES[x] for x in RELEVANT_STATES]
+RFC_TAG: str = "RFC"
 # with these tags will be closed if no updates within TTL
 TTL = {"changes-requested": 3600, "rfc": 3600}
 
-# when we don't interested in this patch anymore
-IRRELEVANT_STATES = {
-    "accepted": 3,
+# when we are not interested in this patch anymore
+IRRELEVANT_STATES: Dict[str, int] = {
     "rejected": 4,
+    "accepted": 3,
     "not-applicable": 6,
     "superseded": 9,
-    "under-review": 2,
     "awaiting-upstream": 8,
     "deferred": 10,
-    "needs-review-ack": 11,
+    "mainlined": 11,
+    "handled-elsewhere": 17,
 }
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+PW_CHECK_PENDING_STATES: Dict[Optional[str], str] = {
+    None: "pending",
+    "cancelled": "pending",
+}
+
+PW_CHECK_CONCLUSIVE_STATES: Dict[str, str] = {
+    "success": "success",
+    "skipped": "success",
+    "warning": "warning",
+    "failure": "fail",
+}
 
 
-class Subject(object):
-    def __init__(self, subject, pw_client):
+PW_CHECK_STATES: Dict[Optional[str], str] = {
+    **PW_CHECK_PENDING_STATES,
+    **PW_CHECK_CONCLUSIVE_STATES,
+}
+
+SUBJECT_REGEXP = re.compile(r"(?P<header>\[[^\]]*\])? *(?P<name>.+)")
+IGNORE_TAGS_REGEX = re.compile(r"([0-9]+/[0-9]+|V[0-9]+)|patch", re.IGNORECASE)
+TAG_REGEXP = re.compile(r"^(\[(?P<tags>[^]]*)\])*")
+PATCH_FILTERING_PROPERTIES = {"project", "delegate"}
+
+logger: logging.Logger = logging.getLogger(__name__)
+meter: metrics.Meter = metrics.get_meter("patchwork")
+
+api_get_requests = meter.create_counter(name="get_requests")
+api_post_requests = meter.create_counter(name="post_requests")
+tag_parsing_failures = meter.create_counter(name="tag_parsing_failures")
+
+
+def log_response(func: Callable[..., requests.Response]):
+    def wrapper(*args, **kwargs) -> requests.Response:
+        resp = func(*args, **kwargs)
+        log = logger.debug if resp.status_code in range(200, 210) else logger.error
+        log("Response code: %s", resp.status_code)
+        try:
+            log("Response data: %s", resp.json())
+        except json.decoder.JSONDecodeError:
+            logger.exception("Failed to decode JSON response")
+        return resp
+
+    return wrapper
+
+
+def time_since_secs(date: str) -> float:
+    parsed_datetime = dateparser.parse(date)
+    duration = datetime.datetime.utcnow() - parsed_datetime
+    return duration.total_seconds()
+
+
+def parse_tags(input: str) -> Set[str]:
+    # "[tag1 ,tag2]title" -> "tag1,tags" -> ["tag1", "tag2"]
+    try:
+        parsed_tags = none_throws(re.match(TAG_REGEXP, input)).group("tags").split(",")
+    except Exception:
+        logger.warning(f"Can't parse tags from string '{input}'")
+        tag_parsing_failures.add(1)
+        return set()
+
+    tags = [tag.strip() for tag in parsed_tags]
+    return {tag for tag in tags if not re.match(IGNORE_TAGS_REGEX, tag)}
+
+
+class Subject:
+    def __init__(self, subject: str, pw_client: "Patchwork") -> None:
         self.pw_client = pw_client
         self.subject = subject
-        self._relevant_series = None
 
     @property
-    def branch(self):
+    def branch(self) -> Optional[str]:
         if len(self.relevant_series) == 0:
             return None
         return f"series/{self.relevant_series[0].id}"
 
-    def __getattr__(self, fn):
-        return getattr(self.relevant_series[-1], fn)
-
     @property
-    def latest_series(self):
+    def latest_series(self) -> Optional["Series"]:
         if len(self.relevant_series) == 0:
             return None
         return self.relevant_series[-1]
 
     @property
-    def relevant_series(self):
+    @cached(cache=TTLCache(maxsize=1, ttl=600))
+    def relevant_series(self) -> List["Series"]:
         """
         cache and return sorted list of relevant series
         where first element is first known version of same subject
         and last is the most recent
         """
-        if self._relevant_series:
-            return self._relevant_series
-        all_series = self.pw_client.get_all("series", filters={"q": self.subject})
-        relevant_series = []
-        for s in all_series:
-            item = Series(s, self.pw_client)
-            # we using full text search which could give ambigous results
-            # so we must filter out irrelevant results
-            if item.subject == self.subject:
-                if item.is_relevant_to_search():
-                    relevant_series.append(item)
-        self._relevant_series = sorted(relevant_series, key=lambda k: k.version)
-        rfcs = sorted(
-            (s for s in relevant_series if RFC_TAG in s.tags), key=lambda k: k.version
-        )
-        non_rfcs = sorted(
-            (s for s in relevant_series if RFC_TAG not in s.tags),
-            key=lambda k: k.version,
-        )
-        self._relevant_series = rfcs + non_rfcs
-        return self._relevant_series
+        series_list = self.pw_client.get_series(params={"q": self.subject})
+
+        # we using full text search which could give ambiguous results
+        # so we must filter out irrelevant results
+        relevant_series = [
+            series
+            for series in series_list
+            if series.subject == self.subject and series.has_matching_patches()
+        ]
+        # sort series by age desc,  so last series is the most recent one
+        return sorted(relevant_series, key=lambda x: x.age(), reverse=True)
 
 
-class Series(object):
-    def __init__(self, data, pw_client):
+class Series:
+    def __init__(self, pw_client: "Patchwork", data: Dict) -> None:
         self.pw_client = pw_client
         self.data = data
-        self._relevant_series = None
-        self._diffs = None
-        self._tags = None
         self._patch_blob = None
-        self._subject_regexp = re.compile(r"(?P<header>\[[^\]]*\])? *(?P<name>.+)")
-        for key in data:
-            setattr(self, key, data[key])
-        self.subject = re.match(self._subject_regexp, data["name"]).group("name")
-        self.ignore_tags = re.compile(r"([0-9]+/[0-9]+|V[0-9]+)|patch", re.IGNORECASE)
-        self.tag_regexp = re.compile(r"^(\[(?P<tags>[^]]*)\])*")
 
-    @property
-    def diffs(self):
-        # fetching patches
+        # We should be able to create object from a short version of series object from /patches/ endpoint
+        # Docs: https://patchwork.readthedocs.io/en/latest/api/rest/schemas/v1.2/#get--api-1.2-patches-
+        # {
+        #     "id": 1,
+        #     "url": "https://example.com",
+        #     "web_url": "https://example.com",
+        #     "name": "string",
+        #     "date": "string",
+        #     "version": 1,
+        #     "mbox": "https://example.com"
+        # }
+        self.id = data["id"]
+        self.name = data["name"]
+        self.date = data["date"]
+        self.url = data["url"]
+        self.web_url = data["web_url"]
+        self.version = data["version"]
+        self.mbox = data["mbox"]
+        self.patches = data.get("patches", [])
+        self.cover_letter = data.get("cover_letter")
+
+        try:
+            self.subject = none_throws(re.match(SUBJECT_REGEXP, data["name"])).group(
+                "name"
+            )
+        except Exception:
+            raise ValueError(
+                f"Failed to parse subject from series name '{data['name']}'"
+            )
+
+    def _is_patch_matching(self, patch: Dict[str, Any]) -> bool:
+        for pattern in self.pw_client.search_patterns:
+            for prop_name, expected_value in pattern.items():
+                if prop_name in PATCH_FILTERING_PROPERTIES:
+                    try:
+                        # these values can be None so we need to filter them out first
+                        if not patch[prop_name]:
+                            return False
+                        if patch[prop_name]["id"] != expected_value:
+                            return False
+                    except KeyError:
+                        return False
+                elif patch[prop_name] != expected_value:
+                    return False
+        return True
+
+    def age(self) -> float:
+        return time_since_secs(self.date)
+
+    @cached(cache=TTLCache(maxsize=1, ttl=600))
+    def get_patches(self) -> List[Dict]:
         """
         Returns patches preserving original order
         for the most recent relevant series
         """
-        if self._diffs:
-            return self._diffs
-        self._diffs = []
-        for patch in self.patches:
-            p = self.pw_client.get("patches", patch["id"])
-            self._diffs.append(p)
-        return self._diffs
+        return [self.pw_client.get_patch_by_id(patch["id"]) for patch in self.patches]
 
-    def _closed(self):
+    def is_closed(self) -> bool:
         """
         Series considered closed if at least one patch in this series
         is in irrelevant states
         """
-        for diff in self.diffs:
-            if diff["state"] in IRRELEVANT_STATES:
+        for patch in self.get_patches():
+            if patch["state"] in IRRELEVANT_STATES:
                 return True
         return False
 
-    @property
-    def closed(self):
-        return self._closed()
-
-    def _parse_for_tags(self, name):
-        match = re.match(self.tag_regexp, name)
-        if not match:
-            return set()
-        r = set()
-        if match.groupdict()["tags"]:
-            tags = match.groupdict()["tags"].split(",")
-            for tag in tags:
-                if not re.match(self.ignore_tags, tag):
-                    r.add(tag)
-        return r
-
-    @property
-    def tags(self):
+    @cached(cache=TTLCache(maxsize=1, ttl=120))
+    def all_tags(self) -> Set[str]:
         """
         Tags fetched from series name, diffs and cover letter
         for most relevant series
         """
-        if self._tags:
-            return self._tags
-        self._tags = set()
-        for diff in self.diffs:
-            self._tags |= self._parse_for_tags(diff["name"])
-            self._tags.add(diff["state"])
+        tags = {f"V{self.version}"}
+
+        for patch in self.get_patches():
+            tags |= parse_tags(patch["name"])
+            tags.add(patch["state"])
+
         if self.cover_letter:
-            self._tags |= self._parse_for_tags(self.cover_letter["name"])
-        self._tags |= self._parse_for_tags(self.name)
-        self._tags.add(f"V{self.version}")
+            tags |= parse_tags(self.cover_letter["name"])
 
-        return self._tags
+        tags |= parse_tags(self.name)
 
-    def _version(self):
-        return self.version
+        return tags
 
-    @property
-    def visible_tags(self):
-        self._visible_tags = set()
-        self._visible_tags.add(f"V{self.version}")
-        for diff in self.diffs:
-            self._visible_tags.add(diff["state"])
+    def visible_tags(self) -> Set[str]:
+        return {f"V{self.version}", *[diff["state"] for diff in self.get_patches()]}
 
-        return self._visible_tags
-
-    @property
-    def expirable(self):
-        for diff in self.diffs:
+    def is_expired(self) -> bool:
+        for diff in self.get_patches():
             if diff["state"] in TTL:
-                return True
-        return False
-
-    def _expired(self):
-        now = datetime.datetime.now()
-        for diff in self.diffs:
-            if diff["state"] in TTL:
-                if self._get_age(diff["date"]) >= TTL[diff["state"]]:
+                if time_since_secs(diff["date"]) >= TTL[diff["state"]]:
                     return True
         return False
 
-    @property
-    def expired(self):
-        return self._expired()
+    def get_patch_blob(self) -> IO:
+        """Returns file-like object"""
+        if not self._patch_blob:
+            data = self.pw_client.get_blob(self.mbox)
+            self._patch_blob = tempfile.NamedTemporaryFile(mode="r+b")
+            self._patch_blob.write(data)
 
-    def _get_age(self, date):
-        now = datetime.datetime.now().astimezone(get_localzone())
-        d = dp.parse(date + "Z").astimezone(get_localzone())
-        return (now - d).total_seconds()
-
-    @property
-    def age(self):
-        return self._get_age(self.date)
-
-    @property
-    def patch_blob(self):
-        """ Returns file-like object """
-        if self._patch_blob:
-            self._patch_blob.seek(0)
-            return self._patch_blob
-        data = self.pw_client.get_blob(self.mbox)
-        self._patch_blob = tempfile.NamedTemporaryFile(mode="r+b")
-        self._patch_blob.write(data)
         self._patch_blob.seek(0)
-
         return self._patch_blob
 
-    def _match_diff(self, pattern, diff):
-        # no special handling for no key exceptions
-        # right now i'm considering that if we wasn't able to find key we want to die
-        for key, value in pattern.items():
-            if key in ["project", "delegate"]:
-                if key not in diff or not diff[key] or "id" not in diff[key]:
-                    return False
-                if diff[key]["id"] != value:
-                    return False
-            elif diff[key] != value:
-                return False
-        return True
+    def has_matching_patches(self) -> bool:
+        for patch in self.get_patches():
+            if self._is_patch_matching(patch):
+                return True
 
-    def is_relevant_to_search(self):
-        for pattern in self.pw_client.pw_search_patterns:
-            for diff in self.diffs:
-                if self._match_diff(pattern, diff):
-                    return True
         return False
 
+    def set_check(self, **kwargs) -> None:
+        for diff in self.get_patches():
+            self.pw_client.post_check(patch_id=diff["id"], orig_data=kwargs)
 
-class Patchwork(object):
+
+class Patchwork(Stats):
     def __init__(
         self,
-        url,
-        pw_search_patterns,
-        pw_lookback=7,
-        filter_tags=None,
-        build_fixtures=False,
-    ):
-        self.build_fixtures = build_fixtures
-        self.server = url
-        self.logger = logging.getLogger(__name__)
+        server: str,
+        search_patterns: List[Dict[str, Any]],
+        auth_token: Optional[str] = None,
+        lookback_in_days: int = 7,
+        api_version: str = "1.2",
+        http_retries: Optional[int] = None,
+    ) -> None:
+        self.api_url = f"https://{server}/api/{api_version}/"
+        self.auth_token = auth_token
+        if not auth_token:
+            logger.warning("Patchwork client runs in read-only mode")
+        self.search_patterns = search_patterns
+        self.since = self.format_since(lookback_in_days)
+        # member variable initializations
+        self.known_series = {}
+        self.known_subjects = {}
+        super().__init__(
+            [
+                "non_api_count",
+                "non_api_time",
+                "series_search_count",
+                "series_search_time",
+                "patches_search_count",
+                "patches_search_time",
+                "series_by_id_count",
+                "series_by_id_time",
+                "patches_by_id_count",
+                "patches_by_id_time",
+            ]
+        )
+        self.http_session = requests.Session()
+        adapter = HTTPAdapter(max_retries=http_retries)
 
-        self.since = self.format_since(pw_lookback)
-        self.pw_search_patterns = pw_search_patterns
-        self.filter_tags = set(filter_tags)
+        self.http_session.mount("http://", adapter)
+        self.http_session.mount("https://", adapter)
 
-    def format_since(self, pw_lookback):
-        today = DT.date.today()
-        lookback = today - DT.timedelta(days=pw_lookback)
+    def format_since(self, pw_lookback: int) -> str:
+        today = datetime.datetime.utcnow().date()
+        lookback = today - datetime.timedelta(days=pw_lookback)
         return lookback.strftime("%Y-%m-%dT%H:%M:%S")
 
-    def _request(self, url):
-        self.logger.debug(f"Patchwork {self.server} request: {url}")
-        ret = requests.get(url)
-        self.logger.debug("Response", ret)
-        try:
-            self.logger.debug("Response data", ret.json())
-        except json.decoder.JSONDecodeError:
-            self.logger.debug("Response data", ret.text)
+    @log_response
+    def __get(self, path: AnyStr, params: Optional[Dict] = None) -> requests.Response:
+        logger.debug(f"Patchwork GET {path}, params: {params}")
+        # pyre-ignore
+        resp = self.http_session.get(url=urljoin(self.api_url, path), params=params)
+        api_get_requests.add(1)
+        return resp
 
-        return ret
+    @Stats.metered("by_id")
+    def __get_object_by_id(self, object_type: str, object_id: int) -> Dict:
+        return self.__get(f"{object_type}/{object_id}/").json()
 
-    def drop_counters(self):
-        self.stats = {"bug_occurence": 0}
-        for obj in ["series", "patches", "projects"]:
-            for query_type in ["by_id", "search"]:
-                self.stats[f"{obj}_{query_type}_count"] = 0
-                self.stats[f"{obj}_{query_type}_time"] = 0
-        self.stats[f"non_api_count"] = 0
-        self.stats[f"non_api_time"] = 0
-
-    def stat_update(self, key, increment=1):
-        try:
-            self.stats[key] += increment
-        except:
-            self.stat_update("bug_occurence")
-            self.logger.error(f"Failed to update stats key: {key}, {increment}")
-
-    def metered(query_type, obj_type=None):
-        def metered_decorator(func):
-            @functools.wraps(func)
-            def metered_wrapper(*args, **kwargs):
-                self = args[0]
-                if not obj_type:
-                    obj = args[1]
-                else:
-                    obj = obj_type
-                start = time.time()
-                result = func(*args, **kwargs)
-                t = time.time() - start
-                self.stat_update(f"{obj}_{query_type}_time", t)
-                self.stat_update(f"{obj}_{query_type}_count")
-                return result
-
-            return metered_wrapper
-
-        return metered_decorator
-
-    @metered("by_id")
-    def get(self, object_type, identifier):
-        return self._get(f"{object_type}/{identifier}/").json()
-
-    @metered("api", obj_type="non")
-    def get_blob(self, url):
-        r = requests.get(url, allow_redirects=True)
-        return r.content
-
-    # this method only used for fixtures collection for unit tests
-    def _get_w_fixtures(self, req):
-        with open("./pw_fixtures.json", "a+") as f:
-            f.seek(0)
-            try:
-                fixtures = json.load(f)
-            except json.decoder.JSONDecodeError:
-                fixtures = {}
-            r = self._request(f"{self.server}/api/1.1/{req}")
-            if req in fixtures:
-                self.logger.warning(f"Repetitive call {req}")
-            fixtures[req] = r.json()
-        with open("./pw_fixtures.json", "w") as f:
-            json.dump(fixtures, f)
-            return r
-
-    def _get(self, req):
-        if self.build_fixtures:
-            return self._get_w_fixtures(req)
-        else:
-            return self._request(f"{self.server}/api/1.1/{req}")
-
-    @metered("search")
-    def get_all(self, object_type, filters=None):
-        if filters is None:
-            filters = {}
-        params = ""
-        for key, val in filters.items():
-            if val is not None:
-                if isinstance(val, list):
-                    for v in val:
-                        params += f"{key}={v}&"
-                else:
-                    params += f"{key}={val}&"
-
+    @Stats.metered("search")
+    def __get_objects_recursive(
+        self, object_type: str, params: Optional[Dict] = None
+    ) -> List[Dict]:
         items = []
+        path = f"{object_type}/"
+        while True:
+            response = self.__get(path, params=params)
+            items += response.json()
 
-        response = self._get(f"{object_type}/?{params}")
-        # Handle paging, by chasing the "Link" elements
-        while response:
-            for o in response.json():
-                items.append(o)
-
-            if "Link" not in response.headers:
+            if "next" not in response.links:
                 break
 
-            # There are multiple links separated by commas
-            links = response.headers["Link"].split(",")
-            # And each link has the format of <url>; rel="type"
-            response = None
-            for link in links:
-                info = link.split(";")
-                if info[1].strip() == 'rel="next"':
-                    response = self._request(info[0][1:-1])
-
+            path = response.links["next"]["url"]
         return items
 
-    def get_project(self, name):
-        all_projects = self.get_all("projects")
-        for project in all_projects:
-            if project["name"] == name:
-                self.logger.debug(f"Found {project}")
-                return project
+    @log_response
+    def __post(self, path: AnyStr, data: Dict) -> requests.Response:
+        logger.debug(f"Patchwork POST {path}, data: {data}")
+        resp = self.http_session.post(
+            # pyre-ignore
+            url=urljoin(self.api_url, path),
+            headers={"Authorization": f"Token {self.auth_token}"},
+            data=data,
+        )
+        api_post_requests.add(1)
+        return resp
 
-    def get_series_by_id(self, sid):
-        # fetches directly only if series is not available in local scope
-        if sid not in self.known_series:
-            series = Series(self.get("series", sid), self)
-            self.known_series[sid] = series
+    def __try_post(self, path: AnyStr, data: Dict) -> Optional[requests.Response]:
+        if not self.auth_token:
+            logger.warning(
+                f"Ignoring POST {path} request: Patchwork client in read-only mode"
+            )
+            return None
+
+        return self.__post(path, data)
+
+    @Stats.metered("api", obj_type="non")
+    def get_blob(self, url: AnyStr) -> bytes:
+        return self.http_session.get(url, allow_redirects=True).content
+
+    def last_check_states_for_context(
+        self, context: str, patch_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return dict of the latest check with matching context and patch_id if exists.
+        Returns None if such check does not exist.
+        """
+
+        # get single latest one with matching context value
+        # patchwork.kernel.org api ignores case for context query
+        checks = self.__get(
+            f"patches/{patch_id}/checks/",
+            params={
+                "context": context,
+                "order": "-date",
+                "per_page": "1",
+            },
+        ).json()
+
+        if len(checks) > 0:
+            return checks[0]
+
+        return None
+
+    def post_check(
+        self, patch_id: int, orig_data: Dict[str, Any]
+    ) -> Optional[requests.Response]:
+        c_data = copy.copy(orig_data)
+        context = c_data["context"]
+        check = self.last_check_states_for_context(context, patch_id)
+
+        if check is None:
+            logger.debug(f"Got {c_data} for {patch_id}")
         else:
-            series = self.known_series[sid]
-        return series
+            logger.debug(f"Got {c_data} for {patch_id} with {check}")
+        if (
+            check is not None  # we posting not the first time
+            and (c_data["state"] in PW_CHECK_PENDING_STATES)  # and new state is pending
+            and (
+                PW_CHECK_PENDING_STATES[c_data["state"]] != check["state"]
+            )  # and old state not pending
+        ):
+            logger.info(
+                f"Not posting state {orig_data} for patch {patch_id}"
+                f" as it's pending and previous state"
+                f"({check['state']}) is available."
+            )
+            return None
 
-    def get_subject_by_series(self, series):
+        # replace check state to one that valid for PW from one that in GH
+        pw_state = PW_CHECK_STATES.get(c_data["state"], PW_CHECK_STATES.get(None))
+        c_data["state"] = pw_state
+        state = pw_state
+        if (
+            check is not None
+            and check.get("state", None) == state
+            and check.get("target_url", None) == c_data["target_url"]
+        ):
+            logger.info(
+                f"Not posting state {c_data} for patch {patch_id} "
+                f"as it's same as previous posted state({state}) and url is the same"
+            )
+            return None
+        return self.__try_post(f"patches/{patch_id}/checks/", data=c_data)
+
+    def get_series_by_id(self, series_id: int) -> Series:
+        # fetches directly only if series is not available in local scope
+        if series_id not in self.known_series:
+            self.known_series[series_id] = Series(
+                self, self.__get_object_by_id("series", series_id)
+            )
+
+        return self.known_series[series_id]
+
+    def get_subject_by_series(self, series: Series) -> Subject:
         # local cache for subjects
         if series.subject not in self.known_subjects:
             subject = Subject(series.subject, self)
             self.known_subjects[series.subject] = subject
-        else:
-            subject = self.known_subjects[series.subject]
-        return subject
 
-    def get_relevant_subjects(self, full=True):
+        return self.known_subjects[series.subject]
+
+    def get_relevant_subjects(self) -> Sequence[Subject]:
         subjects = {}
         filtered_subjects = []
         self.known_series = {}
         self.known_subjects = {}
 
-        for pattern in self.pw_search_patterns:
-            p = {"since": self.since, "state": RELEVANT_STATE_IDS, "archived": False}
+        for pattern in self.search_patterns:
+            p = {
+                "since": self.since,
+                "state": RELEVANT_STATES.values(),
+                "archived": False,
+            }
             p.update(pattern)
-            self.logger.warning(p)
-            all_patches = self.get_all("patches", filters=p)
+            logger.info(f"Searching PW with: {p}")
+            all_patches = self.__get_objects_recursive("patches", params=p)
             for patch in all_patches:
                 patch_series = patch["series"]
                 for series in patch_series:
                     if series["name"]:
-                        s = Series(series, self)
+                        s = Series(self, series)
                         self.known_series[str(s.id)] = s
                     else:
-                        self.stat_update("bug_occurence")
-                        self.logger.error(f"Malformed series: {series}")
+                        self.increment_counter("bug_occurence")
+                        logger.error(f"Malformed series: {series}")
                         continue
+
                     if s.subject not in subjects:
                         subjects[s.subject] = Subject(s.subject, self)
                         self.known_subjects[s.subject] = subjects[s.subject]
-            for subject in subjects:
-                excluded_tags = subjects[subject].tags & self.filter_tags
-                if (
-                    not excluded_tags
-                    and not subjects[subject].expired
-                    and not subjects[subject].closed
-                ):
-                    self.logger.warning(f"Found matching relevant subject {subject}")
-                    filtered_subjects.append(subjects[subject])
-                elif subjects[subject].expired:
-                    self.logger.warning(
-                        f"Filtered {subjects[subject].url} ( {subject} ) as expired",
+
+            logger.info(f"Total subjects: {len(subjects)}")
+            for subject_name, subject_obj in subjects.items():
+                latest_series = subject_obj.latest_series
+                if not latest_series:
+                    logger.error(f"Subject '{subject_name}' doesn't have any series")
+                    continue
+
+                if latest_series.is_expired():
+                    logger.info(
+                        f"Expired: {latest_series.url} {subject_name}",
                     )
-                elif subjects[subject].closed:
-                    self.logger.warning(
-                        f"Filtered {subjects[subject].url} ( {subject} ) as closed",
+                    continue
+                if latest_series.is_closed():
+                    logger.info(
+                        f"Closed: {latest_series.url} {subject_name}",
                     )
-                else:
-                    self.logger.warning(
-                        f"Filtered {subjects[subject].url} ( {subject} )  due to tags: %s",
-                        excluded_tags,
-                    )
+                    continue
+
+                logger.info(f"Relevant: {latest_series.url} {subject_name}")
+                filtered_subjects.append(subject_obj)
         return filtered_subjects
+
+    def get_patch_by_id(self, id: int) -> Dict:
+        return self.__get_object_by_id("patches", id)
+
+    def get_series(self, params: Optional[Dict]) -> List[Series]:
+        return [
+            Series(self, json)
+            for json in self.__get_objects_recursive("series", params=params)
+        ]

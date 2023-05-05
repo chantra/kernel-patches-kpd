@@ -1,108 +1,93 @@
 #!/usr/bin/env python3
-import json
-from github_sync import GithubSync
-from github import Github, GithubException
-from subprocess import Popen, PIPE, STDOUT
 
-import os
-import time
-import sys
-import re
 import argparse
+import json
+import logging
+import os
+import re
+import time
+from subprocess import PIPE, Popen
+from typing import Any, Callable, Dict, Final, Optional
+
+from github import Github, GithubException
+from github.Repository import Repository
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricExporter,
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.sdk.resources import Resource
+
+from .github_sync import GithubSync  # @manual
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
-def get_repo(git, project):
+LOOP_DELAY_SECS: Final[int] = 60
+
+
+def get_repo(git: Github, project: str) -> Repository:
     repo_name = os.path.basename(project)
     try:
         user = git.get_user()
         repo = user.get_repo(repo_name)
     except GithubException:
-        org = os.path.split(project)[0].split(":")[-1]
+        org = ""
+        if "https://" not in project and "ssh://" not in project:
+            org = project.split(":")[-1].split("/")[0]
+        else:
+            org = project.split("/")[-2]
         repo = git.get_organization(org).get_repo(repo_name)
     return repo
 
 
-class PWDaemon(object):
-    def __init__(self, cfg, labels_cfg=None, logger=None, build_fixtures=False):
+class PWDaemon:
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        labels_cfg: Dict[str, str],
+        metrics_logger: Optional[Callable] = None,
+    ) -> None:
+        config_version = cfg.get("version", 0)
+        if config_version != 2:
+            raise ValueError(
+                f"KPD only supports version 2, got version {config_version} instead"
+            )
 
-        with open(cfg) as f:
-            self.config = json.load(f)
-        if labels_cfg:
-            with open(labels_cfg) as f:
-                self.labels_cfg = json.load(f)
-        self.workers = []
-        self.logger = logger
-        for project in self.config.keys():
-            for branch in self.config[project]["branches"].keys():
-                worker_cfg = self.config[project]["branches"][branch]
-                worker = GithubSync(
-                    pw_url=worker_cfg["pw_url"],
-                    pw_search_patterns=worker_cfg["pw_search_patterns"],
-                    pw_lookback=worker_cfg.get("pw_lookback", 7),
-                    master=branch,
-                    repo_url=project,
-                    github_oauth_token=self.config[project]["github_oauth_token"],
-                    sync_from=worker_cfg["upstream"],
-                    source_master=worker_cfg.get("upstream_branch", "master"),
-                    ci_repo=worker_cfg.get("ci_repo", None),
-                    ci_branch=worker_cfg.get("ci_branch", None),
-                    filter_tags=worker_cfg.get("filter_tags", None),
-                    build_fixtures=build_fixtures,
-                )
-                self.workers.append(worker)
-                if labels_cfg:
-                    git = Github(self.config[project]["github_oauth_token"])
-                    repo = get_repo(git, project)
-                    self.color_labels(repo)
+        self.metrics_logger = metrics_logger
+        self.project = cfg["project"]
+        self.worker = GithubSync(config=cfg, labels_cfg=labels_cfg)
 
-    def color_labels(self, repo):
-        all_labels = {x.name.lower(): x for x in repo.get_labels()}
-        for l in self.labels_cfg:
-            label = l.lower()
-            if label in all_labels:
-                if (
-                    all_labels[label].name != l
-                    or all_labels[label].color != self.labels_cfg[l]
-                ):
-                    all_labels[label].edit(name=l, color=self.labels_cfg[l])
-            else:
-                repo.create_label(name=l, color=self.labels_cfg[l])
+    def process_stats(self) -> None:
+        if self.metrics_logger:
+            self.metrics_logger(self.project, self.worker.stats)
 
-    def process_stats(self, worker, logger=None):
-        if logger and os.path.isfile(logger) and os.access(logger, os.X_OK):
-            metrics = {
-                "int": {"time": time.time(),},
-                "float": {},
-                "normal": {"project": worker.repo_url, "branch": worker.master,},
-            }
-            for s in worker.stats:
-                metrics["float"][s] = worker.stats[s]
-
-            worker.repo_url
-            p = Popen([logger], stdout=PIPE, stdin=PIPE, stderr=PIPE)
-            stdout_data = p.communicate(input=json.dumps(metrics).encode())
-
-    def loop(self):
+    def loop(self) -> None:
         while True:
-            for worker in self.workers:
-                worker.sync_branches()
-                self.process_stats(worker, self.logger)
-            time.sleep(300)
+            logger.info("Sync loop starting...")
+            self.worker.sync_patches()
+            self.process_stats()
+            time.sleep(LOOP_DELAY_SECS)
 
 
-def purge(cfg):
+def purge(cfg) -> None:
     with open(cfg) as f:
         config = json.load(f)
-    for project in config.keys():
-        git = Github(config[project]["github_oauth_token"])
+    for project, project_cfg in config.items():
+        git = Github(project_cfg["github_oauth_token"])
         repo = get_repo(git, project)
-        branches = [x for x in repo.get_branches()]
-        for branch_name in branches:
-            if re.match(r"series/[0-9]+.*", branch_name.name):
-                repo.get_git_ref(f"heads/{branch_name.name}").delete()
+        refs_to_remove = [
+            f"heads/{branch_name}"
+            for branch_name in repo.get_branches()
+            if re.match(r"series/[0-9]+.*", branch_name.name)
+        ]
+        logging.info(f"Removing references: {refs_to_remove}")
+        for ref in refs_to_remove:
+            repo.get_git_ref(ref).delete()
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Starts kernel-patches daemon")
     parser.add_argument(
         "--config",
@@ -116,11 +101,8 @@ def parse_args():
     )
     parser.add_argument(
         "--metric-logger",
-        default="~/.kernel-patches/logger.sh",
+        default="~/.kernel-patches/metric_logger.sh",
         help="Specify external scripts which stdin will be fed with metrics",
-    )
-    parser.add_argument(
-        "--build-fixtures", dest="build_fixtures", default=False, action="store_true"
     )
     parser.add_argument(
         "--action",
@@ -132,18 +114,41 @@ def parse_args():
     return args
 
 
+def log_through_script(script: str, metrics: Dict) -> None:
+    if script and os.path.isfile(script) and os.access(script, os.X_OK):
+        p = Popen([script], stdout=PIPE, stdin=PIPE, stderr=PIPE)
+        p.communicate(input=json.dumps(metrics).encode())
+
+
 if __name__ == "__main__":
-    args = parse_args()
-    cfg = os.path.expanduser(args.config)
-    labels = os.path.expanduser(args.label_colors)
-    logger = os.path.expanduser(args.metric_logger)
+    args: argparse.Namespace = parse_args()
+    cfg_file = os.path.expanduser(args.config)
+    labels_file = os.path.expanduser(args.label_colors)
+    metrics_logger_script = os.path.expanduser(args.metric_logger)
+    metrics_logger = lambda metrics: log_through_script(metrics_logger_script, metrics)
+
+    meter_provider = MeterProvider(
+        resource=Resource(attributes={"service_name": "kernel_patches_daemon"}),
+        metric_readers=[PeriodicExportingMetricReader(ConsoleMetricExporter())],
+    )
+    metrics.set_meter_provider(meter_provider)
+
+    with open(cfg_file) as f:
+        cfg = json.load(f)
+
+    with open(labels_file) as f:
+        labels_cfg = json.load(f)
+
     if args.action == "purge":
-        purge(cfg=cfg)
-    else:
-        d = PWDaemon(
-            cfg=cfg,
-            labels_cfg=labels,
-            logger=logger,
-            build_fixtures=args.build_fixtures,
-        )
-        d.loop()
+        try:
+            purge(cfg=cfg)
+            exit(0)
+        except Exception:
+            logger.exception("Failed to purge")
+            exit(1)
+
+    PWDaemon(
+        cfg=cfg,
+        labels_cfg=labels_cfg,
+        metrics_logger=metrics_logger,
+    ).loop()
