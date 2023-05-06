@@ -122,6 +122,12 @@ def log_through_script(script: str, metrics: Dict) -> None:
 
 if __name__ == "__main__":
     args: argparse.Namespace = parse_args()
+
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level="INFO"
+    )
     cfg_file = os.path.expanduser(args.config)
     labels_file = os.path.expanduser(args.label_colors)
     metrics_logger_script = os.path.expanduser(args.metric_logger)
