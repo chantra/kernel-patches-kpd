@@ -131,7 +131,7 @@ if __name__ == "__main__":
     cfg_file = os.path.expanduser(args.config)
     labels_file = os.path.expanduser(args.label_colors)
     metrics_logger_script = os.path.expanduser(args.metric_logger)
-    metrics_logger = lambda metrics: log_through_script(metrics_logger_script, metrics)
+    metrics_logger = lambda _, metrics: log_through_script(metrics_logger_script, metrics)
 
     meter_provider = MeterProvider(
         resource=Resource(attributes={"service_name": "kernel_patches_daemon"}),
