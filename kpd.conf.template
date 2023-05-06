@@ -1,0 +1,35 @@
+{
+    "version": 2,
+    "project": "bpf",
+    "pw_search_patterns": [
+      {"archived": false, "project": 399, "delegate": 121173}
+    ],
+    "pw_url": "https://patchwork.kernel.org",
+    "pw_lookback": 7,
+    "tag_to_branch_mapping": {
+      "bpf" : [ "bpf" ],
+      "bpf-next" : [ "bpf-next" ],
+      "__DEFAULT__" : [ "bpf-next", "bpf" ]
+    },
+    "branches": {
+        "bpf-next": {
+            "github_oauth_token": "{github_token}",
+            "repo": "https://{user}:{github_token}@github.com/kernel-patches/bpf",
+            "upstream": "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git",
+            "upstream_branch": "master",
+            "ci_repo": "https://github.com/kernel-patches/vmtest.git",
+            "ci_branch": "master"
+        },
+        "bpf": {
+            "github_app_id": {github_app_id},
+            "github_installation_id": {github_installation_id},
+            "github_private_key": "{/path/to/ghapp.key}",
+            "repo": "https://github.com/kernel-patches/bpf",
+            "upstream": "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git",
+            "upstream_branch": "master",
+            "ci_repo": "https://github.com/kernel-patches/vmtest.git",
+            "ci_branch": "master"
+        }
+    }
+}
+
